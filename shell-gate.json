@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "commands": {
+    "verify": {
+      "description": "Run the whole test suite",
+      "argv": ["node", "--test", "tests/*.test.mjs"],
+      "timeout_seconds": 300,
+      "approval": "never"
+    },
+    "status": {
+      "description": "Show the working tree",
+      "argv": ["git", "status", "--short"],
+      "approval": "never"
+    },
+    "history": {
+      "description": "Show the last ten commits",
+      "argv": ["git", "log", "--oneline", "-n", "10"],
+      "approval": "never"
+    },
+    "publish": {
+      "description": "Push the current branch: the one command worth asking about every time",
+      "argv": ["git", "push"],
+      "timeout_seconds": 120,
+      "approval": "always"
+    }
+  }
+}
