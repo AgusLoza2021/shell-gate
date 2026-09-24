@@ -1,0 +1,22 @@
+# Normalize every tracked text file to LF in the repository AND in the working
+# tree of a fresh clone, on any platform. Without this, `core.autocrlf=true`
+# (the Windows default in many setups) materialises source files as CRLF, and
+# any test or tool that compares tracked source text against a bare-newline
+# literal fails on a clean checkout while passing locally.
+#
+# This exact defect class already cost pi-telegram-bridge one GitHub Actions
+# run: see its `test(ci)` commits. Cheap to prevent, expensive to debug.
+* text=auto eol=lf
+
+# Windows shells are the exception: cmd.exe and Windows PowerShell are the
+# environments where CRLF is still the safe expectation.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary

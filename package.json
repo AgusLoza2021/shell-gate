@@ -1,0 +1,28 @@
+{
+  "name": "shell-gate",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "author": "Agustin Lozano",
+  "description": "Run a declared, allowlisted set of local commands by name. Default-deny, argv-only, no shell, every run audited.",
+  "keywords": [
+    "allowlist",
+    "argv",
+    "audit-log",
+    "command-runner",
+    "default-deny",
+    "least-privilege",
+    "local-first",
+    "no-shell",
+    "policy",
+    "security",
+    "windows"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

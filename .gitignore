@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# The gate's own output: audit records and runtime state
+audit/
+*.jsonl
+*.log
+
+# Local workflow state (feature task tracking, not shipped)
+odd/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
