@@ -10,11 +10,12 @@
 // line that can change after the fact because someone mutated the command it
 // was built from is not an audit line.
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 import { fingerprintCommand } from './policy.mjs';
 
-const defaultFs = { appendFileSync };
+const defaultFs = { appendFileSync, mkdirSync };
 
 // Outcomes in which a process actually ran. Everything else has nothing to
 // measure, and reporting `0` for something that never started would read as a
@@ -61,11 +62,17 @@ export function formatAuditRecord({ commandName, command, result, now }) {
  * The log is owner-only (0600): it names every command the owner allowed and
  * every one that was refused, which is a map of the machine's capabilities.
  *
+ * The directory is created rather than assumed. The first real run of this
+ * tool failed every command with 'could not write the audit record' because
+ * `audit/` did not exist yet -- and not one unit test saw it, because every
+ * one of them injected a fake filesystem. A gate that refuses to work until
+ * its own log directory happens to exist is a gate nobody keeps.
+ *
  * Fail closed: a failed write reports failure and never throws, because the
  * caller must be able to decide what to do about a gate whose record is
  * unreliable -- and it must not decide that by crashing.
  *
- * @param {{path: string, record: object, fsImpl?: {appendFileSync: Function}}} input
+ * @param {{path: string, record: object, fsImpl?: {mkdirSync: Function, appendFileSync: Function}}} input
  * @returns {{verdict: 'ok'} | {verdict: 'failed', reason: string}}
  */
 export function appendAuditRecord({ path, record, fsImpl = defaultFs } = {}) {
@@ -77,6 +84,7 @@ export function appendAuditRecord({ path, record, fsImpl = defaultFs } = {}) {
   }
 
   try {
+    fsImpl.mkdirSync(dirname(path), { recursive: true });
     fsImpl.appendFileSync(path, `${JSON.stringify(record)}\n`, {
       encoding: 'utf8',
       mode: LOG_MODE,

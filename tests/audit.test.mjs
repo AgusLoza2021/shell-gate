@@ -4,6 +4,12 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+// The real filesystem is imported on purpose. Every other test here injects a
+// fake, and a fake once hid a defect that broke every real run: the log
+// directory did not exist, so the append failed and the gate refused to run.
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { formatAuditRecord, appendAuditRecord } from '../src/audit.mjs';
 
@@ -153,13 +159,22 @@ describe('audit: formatAuditRecord is a value, not a view', () => {
 });
 
 describe('audit: appendAuditRecord appends one line', () => {
-  function spyFs(impl) {
+  function spyFs(onAppend) {
     const calls = [];
+    const mkdirs = [];
+    const order = [];
     return {
       calls,
+      mkdirs,
+      order,
       appendFileSync: (path, data, options) => {
+        order.push('append');
         calls.push({ path, data, options });
-        if (impl) impl(path, data, options);
+        if (onAppend) onAppend(path, data, options);
+      },
+      mkdirSync: (path, options) => {
+        order.push('mkdir');
+        mkdirs.push({ path, options });
       },
     };
   }
@@ -187,8 +202,23 @@ describe('audit: appendAuditRecord appends one line', () => {
     assert.deepEqual(fsImpl.calls.map((call) => call.data), ['{"n":1}\n', '{"n":2}\n']);
   });
 
+  test('the log directory is created before the record is appended', () => {
+    const fsImpl = spyFs();
+    // Both sides use join(), so the assertion describes the directory that was
+    // created rather than the separator this platform happens to use.
+    appendAuditRecord({
+      path: join('audit', 'nested', 'gate.jsonl'),
+      record: { a: 1 },
+      fsImpl,
+    });
+    assert.deepEqual(fsImpl.mkdirs, [{ path: join('audit', 'nested'), options: { recursive: true } }]);
+    // Order matters: appending before creating the directory is the defect.
+    assert.deepEqual(fsImpl.order, ['mkdir', 'append']);
+  });
+
   test('a write failure fails closed instead of throwing', () => {
     const fsImpl = {
+      mkdirSync: () => {},
       appendFileSync: () => {
         throw new Error('EPERM: operation not permitted');
       },
@@ -198,11 +228,76 @@ describe('audit: appendAuditRecord appends one line', () => {
     assert.match(result.reason, /EPERM/);
   });
 
+  test('a failure to create the directory also fails closed', () => {
+    const fsImpl = {
+      mkdirSync: () => {
+        throw new Error('EACCES: permission denied');
+      },
+      appendFileSync: () => {},
+    };
+    const result = appendAuditRecord({ path: 'audit/gate.jsonl', record: { a: 1 }, fsImpl });
+    assert.equal(result.verdict, 'failed');
+    assert.match(result.reason, /EACCES/);
+  });
+
   test('a missing path or record is a failure, not a crash', () => {
     for (const input of [{ record: {} }, { path: 'audit/gate.jsonl' }, {}]) {
       const result = appendAuditRecord({ ...input, fsImpl: spyFs() });
       assert.equal(result.verdict, 'failed', JSON.stringify(input));
       assert.ok(result.reason.length > 0);
     }
+  });
+});
+
+// These run against the real filesystem with no injected collaborators, because
+// that is the configuration the tool actually ships in -- and the one where the
+// missing-directory defect lived undetected.
+describe('audit: against a real filesystem', () => {
+  function withTempDir(run) {
+    const root = mkdtempSync(join(tmpdir(), 'shell-gate-audit-'));
+    try {
+      return run(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test('a nested log path is created rather than assumed to exist', () => {
+    withTempDir((root) => {
+      const path = join(root, 'audit', 'nested', 'gate.jsonl');
+      const result = appendAuditRecord({ path, record: { a: 1 } });
+      assert.equal(result.verdict, 'ok', result.reason);
+      assert.equal(readFileSync(path, 'utf8'), '{"a":1}\n');
+    });
+  });
+
+  test('a second append adds a line instead of replacing the file', () => {
+    withTempDir((root) => {
+      const path = join(root, 'audit', 'gate.jsonl');
+      appendAuditRecord({ path, record: { n: 1 } });
+      appendAuditRecord({ path, record: { n: 2 } });
+      assert.equal(readFileSync(path, 'utf8'), '{"n":1}\n{"n":2}\n');
+    });
+  });
+
+  test('a record written for real is the record that was built', () => {
+    withTempDir((root) => {
+      const path = join(root, 'audit', 'gate.jsonl');
+      const record = formatAuditRecord({
+        commandName: 'status',
+        command: { argv: ['git', 'status'], cwd: null },
+        result: {
+          verdict: 'ok',
+          exitCode: 0,
+          durationMs: 5,
+          stdoutBytes: 3,
+          stderrBytes: 0,
+          truncated: { stdout: false, stderr: false },
+        },
+        now: NOW,
+      });
+      appendAuditRecord({ path, record });
+      assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), record);
+    });
   });
 });
