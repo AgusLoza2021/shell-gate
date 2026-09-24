@@ -6,6 +6,10 @@ audit/
 *.jsonl
 *.log
 
+# Live permissions. Committing this file commits a permission.
+approvals.json
+approvals.json.tmp
+
 # Local workflow state (feature task tracking, not shipped)
 odd/
 

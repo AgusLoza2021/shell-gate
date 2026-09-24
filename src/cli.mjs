@@ -9,12 +9,25 @@
 // a pending approval exits 4 and starts nothing. Both are written to the audit
 // log first, so "the gate said no" leaves evidence, which is exactly the case
 // an owner most needs to reconstruct later.
+//
+// A3 added a second way to say yes -- a decision recorded earlier by `approve`
+// -- and deliberately no new exit code for it. "Nobody ever approved this" and
+// "the approval expired" and "the policy changed since" are all the same
+// answer to the only question an exit code can carry: a human has to decide.
+// Splitting one of those three out would have been arbitrary, and the precise
+// fact travels instead in the reason on stderr, in the audit record and in the
+// --json line, which is where a caller that cares about the difference looks.
+//
+// Failing closed on an unreadable approvals store is the one behaviour worth
+// stating twice: a store we could not verify grants nothing, so the command
+// does not run. An approval that cannot be checked is not an approval.
 
 import { readFileSync } from 'node:fs';
 
 import { parsePolicy, resolveCommand } from './policy.mjs';
 import { formatAuditRecord, appendAuditRecord } from './audit.mjs';
 import { runCommand } from './runner.mjs';
+import { DEFAULT_TTL_SECONDS, consumeApproval, grantApproval } from './approval.mjs';
 
 /**
  * Exit codes. Stable public contract -- a caller switches on these numbers,
@@ -32,6 +45,7 @@ export const EXIT = {
 
 const DEFAULT_POLICY_PATH = 'shell-gate.json';
 const DEFAULT_AUDIT_PATH = 'audit/shell-gate.jsonl';
+const DEFAULT_APPROVALS_PATH = 'approvals.json';
 
 // Machine verdicts are camelCase; a human reading stderr should not have to
 // decode that, and 'timedOut' reads as a typo rather than a sentence.
@@ -47,13 +61,16 @@ const USAGE = `usage: shell-gate <command> [options]
 commands:
   list                  show every declared command
   check <name>          show what <name> would run, without running it
+  approve <name>        record a one-use approval for <name>
   run <name>            run <name>
 
 options:
   --yes, -y             approve a command whose approval is "always"
+  --ttl=<seconds>       how long an approval stays valid (default: ${DEFAULT_TTL_SECONDS})
   --json                print one machine-readable JSON line
   --policy=<path>       policy file (default: ${DEFAULT_POLICY_PATH})
   --audit=<path>        audit log (default: ${DEFAULT_AUDIT_PATH})
+  --approvals=<path>    approvals file (default: ${DEFAULT_APPROVALS_PATH})
   --help, -h            show this text
 
 exit codes:
@@ -61,7 +78,7 @@ exit codes:
   1  usage error
   2  the policy is missing, unreadable or invalid
   3  the name is not declared in the policy
-  4  the command requires approval and --yes was not given
+  4  approval is required and no usable approval was found
   5  the command ran and exited non-zero
   6  the command timed out, could not start, or its record could not be written
 `;
@@ -81,6 +98,8 @@ export async function main({ argv = [], deps = {} } = {}) {
     readFile = (path) => readFileSync(path, 'utf8'),
     runCommand: runCommandImpl = runCommand,
     appendAuditRecord: appendAuditRecordImpl = appendAuditRecord,
+    consumeApproval: consumeApprovalImpl = consumeApproval,
+    grantApproval: grantApprovalImpl = grantApproval,
     now = Date.now,
     write = (text) => process.stdout.write(text),
     writeError = (text) => process.stderr.write(text),
@@ -90,8 +109,10 @@ export async function main({ argv = [], deps = {} } = {}) {
     yes: false,
     json: false,
     help: false,
+    ttlSeconds: null,
     policyPath: DEFAULT_POLICY_PATH,
     auditPath: DEFAULT_AUDIT_PATH,
+    approvalsPath: DEFAULT_APPROVALS_PATH,
   };
   const positional = [];
 
@@ -101,7 +122,21 @@ export async function main({ argv = [], deps = {} } = {}) {
     else if (token === '--help' || token === '-h') flags.help = true;
     else if (token.startsWith('--policy=')) flags.policyPath = token.slice('--policy='.length);
     else if (token.startsWith('--audit=')) flags.auditPath = token.slice('--audit='.length);
-    else if (token.startsWith('-')) {
+    else if (token.startsWith('--approvals=')) {
+      flags.approvalsPath = token.slice('--approvals='.length);
+    } else if (token.startsWith('--ttl=')) {
+      const raw = token.slice('--ttl='.length);
+      // Strictly digits. '1.5' and '30s' must not be silently rounded or
+      // truncated into a lifetime nobody chose -- an approval's expiry is a
+      // security boundary, so a malformed one is refused, not repaired.
+      if (!/^\d+$/.test(raw) || Number(raw) <= 0) {
+        writeError(
+          `shell-gate: --ttl needs a positive whole number of seconds, got ${JSON.stringify(raw)}\n\n${USAGE}`,
+        );
+        return EXIT.USAGE;
+      }
+      flags.ttlSeconds = Number(raw);
+    } else if (token.startsWith('-')) {
       writeError(`shell-gate: unknown flag: ${token}\n\n${USAGE}`);
       return EXIT.USAGE;
     } else positional.push(token);
@@ -119,7 +154,7 @@ export async function main({ argv = [], deps = {} } = {}) {
   }
   // Reject an unknown subcommand before touching the policy: "the file is
   // missing" is a misleading answer to "you typed the command wrong".
-  if (subcommand !== 'list' && subcommand !== 'check' && subcommand !== 'run') {
+  if (!['list', 'check', 'approve', 'run'].includes(subcommand)) {
     writeError(`shell-gate: unknown command: ${subcommand}\n\n${USAGE}`);
     return EXIT.USAGE;
   }
@@ -194,38 +229,138 @@ export async function main({ argv = [], deps = {} } = {}) {
     return EXIT.OK;
   }
 
-  // subcommand === 'run'
-  const resolved = resolveCommand(policy, name);
-  if (resolved.verdict !== 'ok') {
+  // A denial is three effects that must never drift apart: a record, a message
+  // and a number. Written once so they cannot.
+  const deny = (commandName, reason) => {
+    audit({ commandName, command: null, result: { verdict: 'denied', reason }, now: now() });
+    writeError(`shell-gate: unknown command: ${commandName}\n`);
+    if (flags.json) {
+      write(`${JSON.stringify({ command: commandName, outcome: 'denied', reason })}\n`);
+    }
+    return EXIT.DENIED;
+  };
+
+  if (subcommand === 'approve') {
+    const resolved = resolveCommand(policy, name);
+    if (resolved.verdict !== 'ok') return deny(name, resolved.reason);
+    const target = resolved.command;
+
+    const granted = grantApprovalImpl({
+      path: flags.approvalsPath,
+      commandName: name,
+      command: target,
+      now: now(),
+      ttlSeconds: flags.ttlSeconds ?? DEFAULT_TTL_SECONDS,
+    });
+    if (granted.verdict !== 'ok') {
+      writeError(`shell-gate: could not record the approval: ${granted.reason}\n`);
+      return EXIT.UNAVAILABLE;
+    }
+
+    // A decision is a security event, so it gets a record like one. Without it
+    // the log could show a run authorised by 'stored' and no evidence of anyone
+    // ever having stored anything. 'granted' is not an executed outcome, so the
+    // audit module already records it with no measurements but with the
+    // command's fingerprint -- which is the shape this event wants.
     audit({
       commandName: name,
-      command: null,
-      result: { verdict: 'denied', reason: resolved.reason },
+      command: target,
+      result: { verdict: 'granted' },
+      approval: 'stored',
       now: now(),
     });
-    writeError(`shell-gate: unknown command: ${name}\n`);
-    if (flags.json) write(`${JSON.stringify({ command: name, outcome: 'denied' })}\n`);
-    return EXIT.DENIED;
+
+    if (target.approval === 'never') {
+      writeError(
+        `shell-gate: note: "${name}" never requires approval, so this decision will not be used unless the policy changes\n`,
+      );
+    }
+
+    if (flags.json) {
+      write(
+        `${JSON.stringify({
+          command: name,
+          outcome: 'granted',
+          fingerprint: granted.approval.fingerprint,
+          grantedAt: granted.approval.grantedAt,
+          expiresAt: granted.approval.expiresAt,
+        })}\n`,
+      );
+    } else {
+      write(`approved: ${name} (one use)\n`);
+      write(`  fingerprint  ${granted.approval.fingerprint}\n`);
+      write(`  granted at   ${granted.approval.grantedAt}\n`);
+      write(`  expires      ${granted.approval.expiresAt}\n`);
+    }
+    return EXIT.OK;
   }
+
+  // subcommand === 'run'
+  const resolved = resolveCommand(policy, name);
+  if (resolved.verdict !== 'ok') return deny(name, resolved.reason);
   const target = resolved.command;
 
   // The approval gate sits before the runner, not inside it: the runner's job
   // is to run a command that was already authorised. A refusal here must not
-  // reach it at all, and the test asserts exactly that.
-  if (target.approval === 'always' && !flags.yes) {
-    audit({
-      commandName: name,
-      command: target,
-      result: { verdict: 'needs-approval', reason: 'approval is "always"' },
-      now: now(),
-    });
-    writeError(`shell-gate: "${name}" requires approval; re-run with --yes to approve it\n`);
-    if (flags.json) write(`${JSON.stringify({ command: name, outcome: 'needs-approval' })}\n`);
-    return EXIT.APPROVAL_REQUIRED;
+  // reach it at all, and the tests assert exactly that.
+  let approvalKind = 'not-required';
+  if (target.approval === 'always') {
+    if (flags.yes) {
+      // A decision made in the moment wins over a stored one because it is the
+      // only one that costs nothing a later invocation could have spent.
+      approvalKind = 'interactive';
+    } else {
+      const consumed = consumeApprovalImpl({
+        path: flags.approvalsPath,
+        commandName: name,
+        command: target,
+        now: now(),
+      });
+      // Fail closed. A store that cannot be read settles nothing, so the command
+      // does not run on the strength of an approval that was never verified.
+      // The refusal is audited like every other one: 'needs-approval' plus a
+      // reason that names the real cause, because a gate that goes quiet exactly
+      // when its own bookkeeping breaks leaves nothing to investigate.
+      if (consumed.verdict === 'failed') {
+        audit({
+          commandName: name,
+          command: target,
+          result: { verdict: 'needs-approval', reason: consumed.reason },
+          now: now(),
+        });
+        writeError(`shell-gate: ${consumed.reason}\n`);
+        return EXIT.UNAVAILABLE;
+      }
+      if (consumed.verdict !== 'ok') {
+        audit({
+          commandName: name,
+          command: target,
+          result: { verdict: 'needs-approval', reason: consumed.reason },
+          now: now(),
+        });
+        writeError(`shell-gate: "${name}" requires approval: ${consumed.reason}\n`);
+        writeError(
+          `shell-gate: re-run with --yes to approve it now, or record one in advance: shell-gate approve ${name}\n`,
+        );
+        if (flags.json) {
+          write(
+            `${JSON.stringify({ command: name, outcome: 'needs-approval', reason: consumed.reason })}\n`,
+          );
+        }
+        return EXIT.APPROVAL_REQUIRED;
+      }
+      approvalKind = 'stored';
+    }
   }
 
   const result = await runCommandImpl({ command: target });
-  const recorded = audit({ commandName: name, command: target, result, now: now() });
+  const recorded = audit({
+    commandName: name,
+    command: target,
+    result,
+    approval: approvalKind,
+    now: now(),
+  });
 
   if (flags.json) {
     write(
