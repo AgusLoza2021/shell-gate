@@ -1,17 +1,19 @@
 # shell-gate
 
+[![CI](https://github.com/AgusLoza2021/shell-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/AgusLoza2021/shell-gate/actions/workflows/ci.yml)
+
 Run a **declared** set of local commands by name. Default-deny, argv-only, no
-shell, every run audited.
+shell, every run audited, every approval spent once.
 
 ```console
-$ shell-gate run verify
-ℹ tests 106
-ℹ pass 106
+$ node bin/shell-gate.mjs run verify
+ℹ tests 182
+ℹ pass 182
 ℹ fail 0
 shell-gate: verify ok (exit 0, 2432ms)
 ```
 
-> **Status: v0.1.0, command line only.** There is no chat adapter yet — that is
+> **Status: v0.2.0, command line only.** There is no chat adapter yet — that is
 > the point of this layer, not an omission. See [Roadmap](#roadmap).
 
 ---
