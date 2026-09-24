@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: this workflow only runs tests.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run both platforms even if one fails, so the result is a complete
+      # picture rather than whichever failure happened first.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No install step: the project has zero dependencies, and that is a
+      # feature worth keeping visible.
+      - name: Test suite
+        run: npm test
+
+      # The interesting check on a fresh runner. A clone has no audit/
+      # directory, and `run status` only succeeds if the policy loads, the
+      # runner starts a real process, and the audit record is written -- an
+      # unwritable record exits 6. So this step's exit code is the assertion,
+      # and it is the defect that a full green suite once failed to catch.
+      - name: The gate runs for real on a clean checkout
+        run: node bin/shell-gate.mjs run status
