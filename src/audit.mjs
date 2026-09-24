@@ -24,13 +24,21 @@ const EXECUTED_OUTCOMES = new Set(['ok', 'failed', 'timedOut']);
 
 const LOG_MODE = 0o600;
 
+// How a run came to be authorised. Capa 2 introduced a second way to say yes,
+// and after the fact "someone typed --yes" and "a decision was made earlier"
+// must be tellable apart: that difference is the whole reason the second path
+// exists. `null` means the caller did not record it, which is honest, and a
+// value outside this set degrades to null rather than inventing a new kind of
+// authorisation in the log.
+const APPROVAL_KINDS = new Set(['not-required', 'interactive', 'stored']);
+
 /**
  * Build one audit record.
  *
- * @param {{commandName: string, command: object|null, result: {verdict: string, reason?: string, exitCode?: number|null, durationMs?: number|null, stdoutBytes?: number|null, stderrBytes?: number|null, truncated?: object|null}, now: number}} input
+ * @param {{commandName: string, command: object|null, result: {verdict: string, reason?: string, exitCode?: number|null, durationMs?: number|null, stdoutBytes?: number|null, stderrBytes?: number|null, truncated?: object|null}, approval?: string, now: number}} input
  * @returns {object} A plain, JSON-serializable record.
  */
-export function formatAuditRecord({ commandName, command, result, now }) {
+export function formatAuditRecord({ commandName, command, result, approval, now }) {
   const outcome = result?.verdict ?? 'spawn-failed';
   const executed = EXECUTED_OUTCOMES.has(outcome);
   const hasCommand = command !== null && command !== undefined;
@@ -53,6 +61,12 @@ export function formatAuditRecord({ commandName, command, result, now }) {
     stdoutBytes: measured(result?.stdoutBytes),
     stderrBytes: measured(result?.stderrBytes),
     truncated: measured(result?.truncated),
+    // Deliberately NOT passed through `measured`. The byte counts describe what
+    // a process produced, so they are meaningless when none ran; this one is
+    // provenance, and the case worth recording is an approval that was spent
+    // and then failed to start. Forcing it to null with the measurements would
+    // erase exactly that fact.
+    approval: APPROVAL_KINDS.has(approval) ? approval : null,
   };
 }
 

@@ -22,7 +22,9 @@ const COMMAND = {
   max_output_bytes: 1024,
 };
 
-function executedRecord(overrides = {}) {
+// `approval` is hoisted out of the result: it is the caller's decision, not the
+// runner's output, and the two arrive at formatAuditRecord as siblings.
+function executedRecord({ approval, ...resultOverrides } = {}) {
   return formatAuditRecord({
     commandName: 'test',
     command: COMMAND,
@@ -33,8 +35,9 @@ function executedRecord(overrides = {}) {
       stdoutBytes: 42,
       stderrBytes: 0,
       truncated: { stdout: false, stderr: false },
-      ...overrides,
+      ...resultOverrides,
     },
+    approval,
     now: NOW,
   });
 }
@@ -155,6 +158,68 @@ describe('audit: formatAuditRecord is a value, not a view', () => {
   test('one record fits on one line, so the log stays line-delimited', () => {
     const line = JSON.stringify(executedRecord());
     assert.equal(line.includes('\n'), false);
+  });
+});
+
+describe('audit: the record says how the run was authorised', () => {
+  test('a command that needs no approval is recorded as not-required', () => {
+    const record = executedRecord({ approval: 'not-required' });
+    assert.equal(record.approval, 'not-required');
+  });
+
+  test('a decision made in the moment is recorded as interactive', () => {
+    const record = executedRecord({ approval: 'interactive' });
+    assert.equal(record.approval, 'interactive');
+  });
+
+  test('a decision made earlier is recorded as stored', () => {
+    const record = executedRecord({ approval: 'stored' });
+    assert.equal(record.approval, 'stored');
+  });
+
+  test('an authorisation that was not recorded is null, never a guess', () => {
+    assert.equal(executedRecord().approval, null);
+  });
+
+  test('a value the log does not define becomes null, not a new kind of authorisation', () => {
+    for (const approval of ['yes', 'approved', '', 0, {}, ['stored']]) {
+      assert.equal(executedRecord({ approval }).approval, null, JSON.stringify(approval));
+    }
+  });
+
+  test('a refusal has no authorisation to record', () => {
+    const record = formatAuditRecord({
+      commandName: 'rm',
+      command: null,
+      result: { verdict: 'denied', reason: 'unknown command' },
+      now: NOW,
+    });
+    assert.equal(record.approval, null);
+  });
+
+  test('the authorisation is provenance, not a measurement: a spent approval still shows', () => {
+    // A stored approval that was consumed and then failed to start is the case
+    // that matters operationally: a decision was spent and nothing ran. Forcing
+    // this field to null for every non-executed outcome -- as the byte counts
+    // are -- would erase exactly the fact worth knowing.
+    const record = formatAuditRecord({
+      commandName: 'publish',
+      command: COMMAND,
+      result: { verdict: 'spawn-failed', reason: 'ENOENT' },
+      approval: 'stored',
+      now: NOW,
+    });
+    assert.equal(record.outcome, 'spawn-failed');
+    assert.equal(record.approval, 'stored');
+    assert.equal(record.exitCode, null);
+  });
+
+  test('every record carries the field, so the log has one shape', () => {
+    for (const approval of [undefined, 'stored', 'nonsense']) {
+      const record = executedRecord(approval === undefined ? {} : { approval });
+      assert.ok('approval' in record);
+      assert.ok(record.approval === null || typeof record.approval === 'string');
+    }
   });
 });
 
