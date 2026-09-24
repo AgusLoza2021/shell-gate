@@ -19,6 +19,9 @@
     "windows"
   ],
   "type": "module",
+  "bin": {
+    "shell-gate": "bin/shell-gate.mjs"
+  },
   "engines": {
     "node": ">=24"
   },
